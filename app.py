@@ -20,41 +20,37 @@ def normalizar_texto(texto):
     texto = re.sub(r'[^a-z0-9\s]', ' ', texto)
     return texto
 
+@st.cache_data
 def carregar_categorias():
     try:
         df_cat = pd.read_excel("template_shopee_Categoria.xlsx").fillna('')
-        colunas_categoria = ['Categoria', 'Subcategoria', 'Categoria de 3º nível', 'Categoria de 4º nível', 'Categoria do 5º nível']
+        # Detecta automaticamente a coluna de ID e nome
+        col_id = [col for col in df_cat.columns if 'id' in col.lower() and 'categoria' in col.lower()][0]
+        col_nome_cats = [col for col in df_cat.columns if 'categoria' in col.lower() and 'id' not in col.lower()]
+
         dicionario = []
         for _, row in df_cat.iterrows():
-            partes_nome = [str(row[col]) for col in colunas_categoria if col in row and row[col]]
-            texto_completo = " ".join(partes_nome)
-            palavras_chave = normalizar_texto(texto_completo).split()
-            id_categoria = row.get('ID da categoria', None)
+            partes_nome = [str(row[col]) for col in col_nome_cats if row[col]]
+            texto_completo = " > ".join(partes_nome)
+            palavras_chave = normalizar_texto(texto_completo)
+            id_categoria = row[col_id]
             if id_categoria and texto_completo:
-                dicionario.append({"id": id_categoria, "palavras": list(set(palavras_chave)), "nome_completo": texto_completo.strip()})
+                dicionario.append({
+                    "id": str(int(id_categoria)),
+                    "nome_completo": texto_completo.strip(),
+                    "palavras": palavras_chave
+                })
         return dicionario
-    except:
+    except Exception as e:
+        st.error(f"Erro ao ler categorias: {e}")
         return []
-
-def encontrar_categoria_id(nome_produto, dicionario):
-    if not dicionario or not nome_produto: return None
-    nome_norm = normalizar_texto(nome_produto)
-    palavras_produto = set(nome_norm.split())
-    melhor_match = {"score": 0, "id": None}
-    for cat in dicionario:
-        palavras_cat = set(cat["palavras"])
-        score = len(palavras_produto.intersection(palavras_cat))
-        if score > melhor_match["score"]:
-            melhor_match["score"] = score
-            melhor_match["id"] = cat["id"]
-    return melhor_match["id"] if melhor_match["score"] > 0 else None
 
 def init_db():
     conn = sqlite3.connect(DB)
     c = conn.cursor()
     c.execute('''CREATE TABLE IF NOT EXISTS produtos
                  (id INTEGER PRIMARY KEY, nome TEXT, preco REAL, url_ali TEXT, url_imgbb TEXT,
-                  categoria_id TEXT, peso REAL, comprimento REAL, largura REAL, altura REAL, atributos TEXT)''')
+                  categoria_id TEXT, categoria_nome TEXT, peso REAL, comprimento REAL, largura REAL, altura REAL)''')
     conn.commit()
     conn.close()
 
@@ -70,12 +66,12 @@ def rehost_imgbb(url_original):
     except: pass
     return None
 
-def salvar_produto(nome, preco, url_ali, cat_id):
+def salvar_produto(nome, preco, url_ali, cat_id, cat_nome):
     url_imgbb = rehost_imgbb(url_ali)
     conn = sqlite3.connect(DB)
     c = conn.cursor()
-    c.execute("INSERT INTO produtos (nome, preco, url_ali, url_imgbb, categoria_id, peso, comprimento, largura, altura, atributos) VALUES (?,?,?,?,?,?,?,?,?,?)",
-              (nome, preco, url_ali, url_imgbb, cat_id, 0.5, 10, 10, 10, 'Marca:Sem marca|Condição:Novo|Material:Plástico|País de Origem:China|Duração da Garantia:7 dias'))
+    c.execute("INSERT INTO produtos (nome, preco, url_ali, url_imgbb, categoria_id, categoria_nome, peso, comprimento, largura, altura) VALUES (?,?,?,?,?,?,?,?,?,?)",
+              (nome, preco, url_ali, url_imgbb, cat_id, cat_nome, 0.5, 10, 10, 10))
     conn.commit()
     conn.close()
 
@@ -97,17 +93,14 @@ def gerar_excel_shopee():
         linha = 7 + i
         urls = [f"{row['url_imgbb']}?v={j}" for j in range(1, 4)] if row['url_imgbb'] else [None]*3
         dados = {
-            "Nome do Produto": row['nome'][:120],
-            "Preço": row['preco'],
+            "Nome do Produto": row['nome'][:120], "Preço": row['preco'],
             "Imagem de Capa": urls[0], "Imagem 1": urls[0], "Imagem 2": urls[1], "Imagem 3": urls[2],
-            "Categoria": row['categoria_id'],
-            "Estoque": 10, "Peso": row['peso'], "Comprimento": row['comprimento'],
-            "Largura": row['largura'], "Altura": row['altura'],
-            "Descrição do Produto": f"Produto: {row['nome']}<br>Envio rápido. Garantia 7 dias."
+            "Categoria": row['categoria_id'], "Estoque": 10, "Peso": row['peso'],
+            "Comprimento": row['comprimento'], "Largura": row['largura'], "Altura": row['altura'],
+            "Descrição do Produto": f"Produto: {row['nome']}<br>Envio rápido. Garantia 7 dias.",
+            "Marca": "Sem marca", "Condição": "Novo", "Material": "Plástico",
+            "País de Origem": "China", "Duração da Garantia": "7 dias"
         }
-        for attr in row['atributos'].split('|'):
-            k, v = attr.split(':')
-            dados[k.strip()] = v.strip()
         for col_nome, valor in dados.items():
             if col_nome in header_map and valor:
                 ws.cell(row=linha, column=header_map[col_nome], value=valor)
@@ -130,12 +123,27 @@ with tab1:
     preco = st.number_input("Preço", min_value=0.0, format="%.2f")
     url_ali = st.text_input("URL da Imagem Principal")
 
-    cat_sugerida = encontrar_categoria_id(nome, DIC_CATEGORIAS)
-    st.info(f"Categoria detectada: {cat_sugerida if cat_sugerida else 'Nenhuma - ajuste manual depois'}")
+    # Busca de categoria com selectbox
+    busca_cat = st.text_input("Buscar categoria", placeholder="Digite: fone, blusa, luminaria...")
+    cats_filtradas = DIC_CATEGORIAS
+    if busca_cat:
+        busca_norm = normalizar_texto(busca_cat)
+        cats_filtradas = [c for c in DIC_CATEGORIAS if busca_norm in c["palavras"]]
+
+    opcoes_cat = {c["nome_completo"]: c["id"] for c in cats_filtradas[:50]} # Mostra só 50 pra não travar
+    opcoes_cat["-- Nenhuma / Preencher depois --"] = ""
+
+    cat_selecionada_nome = st.selectbox("Selecione a Categoria", options=list(opcoes_cat.keys()))
+    cat_id_final = opcoes_cat[cat_selecionada_nome]
+
+    if cat_id_final:
+        st.success(f"ID da Categoria: {cat_id_final}")
+    else:
+        st.warning("Sem categoria. Você pode preencher depois direto na Shopee.")
 
     if st.button("Salvar Produto", type="primary"):
         if nome and url_ali:
-            salvar_produto(nome, preco, url_ali, cat_sugerida)
+            salvar_produto(nome, preco, url_ali, cat_id_final, cat_selecionada_nome)
             st.success("Produto salvo!")
             st.rerun()
 
@@ -143,15 +151,9 @@ with tab2:
     df = carregar_produtos()
     st.subheader(f"Produtos cadastrados: {len(df)}")
     if not df.empty:
-        st.dataframe(df[['nome', 'preco', 'categoria_id', 'url_imgbb']], use_container_width=True, hide_index=True)
+        st.dataframe(df[['nome', 'preco', 'categoria_nome', 'url_imgbb']], use_container_width=True, hide_index=True)
         st.divider()
         excel_bytes = gerar_excel_shopee()
-        st.download_button(
-            label="📥 Baixar Excel Pronto pra Shopee",
-            data=excel_bytes,
-            file_name="shopee_upload.xlsx",
-            mime="application/vnd.ms-excel",
-            type="primary"
-        )
+        st.download_button("📥 Baixar Excel Pronto pra Shopee", data=excel_bytes, file_name="shopee_upload.xlsx", type="primary")
     else:
         st.info("Nenhum produto cadastrado.")
